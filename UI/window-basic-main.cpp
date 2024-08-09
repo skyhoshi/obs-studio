@@ -36,6 +36,7 @@
 #include <QScrollBar>
 #include <QTextStream>
 #include <QActionGroup>
+#include <qt-wrappers.hpp>
 
 #include <util/dstr.h>
 #include <util/util.hpp>
@@ -67,7 +68,6 @@
 #include "window-youtube-actions.hpp"
 #include "youtube-api-wrappers.hpp"
 #endif
-#include "qt-wrappers.hpp"
 #include "context-bar-controls.hpp"
 #include "obs-proxy-style.hpp"
 #include "display-helpers.hpp"
@@ -328,6 +328,8 @@ OBSBasic::OBSBasic(QWidget *parent)
 	setAcceptDrops(true);
 
 	setContextMenuPolicy(Qt::CustomContextMenu);
+
+	QEvent::registerEventType(QEvent::User + QEvent::Close);
 
 	api = InitializeAPIInterface(this);
 
@@ -1163,6 +1165,33 @@ void OBSBasic::Load(const char *file)
 	obs_data_t *data = obs_data_create_from_json_file_safe(file, "bak");
 	if (!data) {
 		disableSaving--;
+		const auto path = filesystem::u8path(file);
+		const string name = path.stem().u8string();
+		/* Check if file exists but failed to load. */
+		if (filesystem::exists(path)) {
+			/* Assume the file is corrupt and rename it to allow
+			 * for manual recovery if possible. */
+			auto newPath = path;
+			newPath.concat(".invalid");
+
+			blog(LOG_WARNING,
+			     "File exists but appears to be corrupt, renaming "
+			     "to \"%s\" before continuing.",
+			     newPath.filename().u8string().c_str());
+
+			error_code ec;
+			filesystem::rename(path, newPath, ec);
+			if (ec) {
+				blog(LOG_ERROR,
+				     "Failed renaming corrupt file with %d",
+				     ec.value());
+			}
+		}
+
+		config_set_string(App()->GlobalConfig(), "Basic",
+				  "SceneCollection", name.c_str());
+		config_set_string(App()->GlobalConfig(), "Basic",
+				  "SceneCollectionFile", name.c_str());
 		blog(LOG_INFO, "No scene file found, creating default scene");
 		CreateDefaultScene(true);
 		SaveProject();
@@ -1293,10 +1322,8 @@ retryScene:
 
 	if (!curScene) {
 		auto find_scene_cb = [](void *source_ptr, obs_source_t *scene) {
-			OBSSourceAutoRelease &source =
-				reinterpret_cast<OBSSourceAutoRelease &>(
-					source_ptr);
-			source = obs_source_get_ref(scene);
+			*static_cast<OBSSourceAutoRelease *>(source_ptr) =
+				obs_source_get_ref(scene);
 			return false;
 		};
 		obs_enum_scenes(find_scene_cb, &curScene);
@@ -1501,9 +1528,8 @@ bool OBSBasic::LoadService()
 	if (!service)
 		return false;
 
-	/* Enforce Opus on FTL if needed */
-	if (strcmp(obs_service_get_protocol(service), "FTL") == 0 ||
-	    strcmp(obs_service_get_protocol(service), "WHIP") == 0) {
+	/* Enforce Opus on WHIP if needed */
+	if (strcmp(obs_service_get_protocol(service), "WHIP") == 0) {
 		const char *option = config_get_string(
 			basicConfig, "SimpleOutput", "StreamAudioEncoder");
 		if (strcmp(option, "opus") != 0)
@@ -1871,7 +1897,6 @@ bool OBSBasic::InitBasicConfigDefaults()
 }
 
 extern bool EncoderAvailable(const char *encoder);
-extern bool update_nvenc_presets(ConfigFile &config);
 
 void OBSBasic::InitBasicConfigDefaults2()
 {
@@ -1896,9 +1921,6 @@ void OBSBasic::InitBasicConfigDefaults2()
 				  aac_default);
 	config_set_default_string(basicConfig, "AdvOut", "RecAudioEncoder",
 				  aac_default);
-
-	if (update_nvenc_presets(basicConfig))
-		config_save_safe(basicConfig, "tmp", nullptr);
 }
 
 bool OBSBasic::InitBasicConfig()
@@ -2038,7 +2060,9 @@ void OBSBasic::ResetOutputs()
 	bool advOut = astrcmpi(mode, "Advanced") == 0;
 
 	if ((!outputHandler || !outputHandler->Active()) &&
-	    startStreamingFuture.future.isFinished()) {
+	    (!setupStreamingGuard.valid() ||
+	     setupStreamingGuard.wait_for(std::chrono::seconds{0}) ==
+		     std::future_status::ready)) {
 		outputHandler.reset();
 		outputHandler.reset(advOut ? CreateAdvancedOutputHandler(this)
 					   : CreateSimpleOutputHandler(this));
@@ -5170,18 +5194,11 @@ void OBSBasic::ClearSceneData()
 
 void OBSBasic::closeEvent(QCloseEvent *event)
 {
-	if (!startStreamingFuture.future.isFinished() &&
-	    !startStreamingFuture.future.isCanceled()) {
-		startStreamingFuture.future.onCanceled(
-			this, [basic = QPointer{this}] {
-				if (basic)
-					basic->close();
-			});
-		startStreamingFuture.cancelAll();
-		event->ignore();
-		return;
-	} else if (startStreamingFuture.future.isCanceled() &&
-		   !startStreamingFuture.future.isFinished()) {
+	/* Wait for multitrack video stream to start/finish processing in the background */
+	if (setupStreamingGuard.valid() &&
+	    setupStreamingGuard.wait_for(std::chrono::seconds{0}) !=
+		    std::future_status::ready) {
+		QTimer::singleShot(1000, this, &OBSBasic::close);
 		event->ignore();
 		return;
 	}
@@ -7109,8 +7126,7 @@ void OBSBasic::StartStreaming()
 		sysTrayStream->setText("Basic.Main.PreparingStream");
 	}
 
-	auto holder = outputHandler->SetupStreaming(service);
-	auto future = holder.future.then(this, [&](bool setupStreamingResult) {
+	auto finish_stream_setup = [&](bool setupStreamingResult) {
 		if (!setupStreamingResult) {
 			DisplayStreamStartError();
 			return;
@@ -7152,8 +7168,10 @@ void OBSBasic::StartStreaming()
 		if (!autoStartBroadcast)
 			OBSBasic::ShowYouTubeAutoStartWarning();
 #endif
-	});
-	startStreamingFuture = {holder.cancelAll, future};
+	};
+
+	setupStreamingGuard =
+		outputHandler->SetupStreaming(service, finish_stream_setup);
 }
 
 void OBSBasic::BroadcastButtonClicked()
@@ -9079,10 +9097,10 @@ void OBSBasic::CenterSelectedSceneItems(const CenterType &centerType)
 
 		GetItemBox(item, tl, br);
 
-		left = (std::min)(tl.x, left);
-		top = (std::min)(tl.y, top);
-		right = (std::max)(br.x, right);
-		bottom = (std::max)(br.y, bottom);
+		left = std::min(tl.x, left);
+		top = std::min(tl.y, top);
+		right = std::max(br.x, right);
+		bottom = std::max(br.y, bottom);
 	}
 
 	center.x = (right + left) / 2.0f;
